@@ -6,6 +6,7 @@ use App\Models\ScoreEntry;
 use App\Models\ScoreSheet;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Storage;
 
@@ -45,10 +46,9 @@ class ScanController extends Controller
             if ($extension === 'pdf') {
                 $extracted = $this->extractFromPdf($fullPath);
             } else {
-                // Image: OCR was already done in the browser (Tesseract.js)
-                // The extracted text arrives as a POST field, not re-processed here
-                $rawText = $request->input('ocr_text', '');
-                $extracted = $this->parseOcrText($rawText);
+                // Image: server-side Tesseract first, with automatic Gemini
+                // vision fallback for handwriting / low-quality scans
+                $extracted = $this->extractFromImage($fullPath);
             }
 
             Storage::disk('local')->delete($storedPath);
@@ -181,27 +181,257 @@ class ScanController extends Controller
         $pdf = $parser->parseFile($pdfPath);
         $rawText = $pdf->getText();
 
-        if (empty(trim($rawText))) {
+        if ($this->hasSubstantiveText($rawText)) {
+            return $this->parseOcrText($rawText);
+        }
+
+        // No real text layer — this PDF is a photo/scan wrapped in a PDF
+        // container (common with scanner apps like CamScanner, which embed
+        // only a watermark string such as "CamScanner" as the "text").
+        // Rasterize each page and run it through the same Tesseract → AI
+        // vision fallback pipeline used for photo uploads.
+        $pages = $this->rasterizePdfPages($pdfPath);
+
+        if (empty($pages)) {
             throw new \RuntimeException(
-                'This PDF appears to be a scanned image (no embedded text). ' .
-                'Please take a photo of it and upload as an image instead.'
+                'No readable text could be found in this PDF, and it could not be converted to an '
+                . 'image for OCR either (the server is missing the pdftoppm/poppler-utils tool). '
+                . 'Please re-save it as a JPG/PNG and upload using "Hardcopy Photo / Scan" mode instead.'
             );
         }
 
-        return $this->parseOcrText($rawText);
+        $combined = ['sheet_meta' => $this->extractMeta([]), 'entries' => []];
+        $usedAiVision = false;
+
+        foreach ($pages as $pagePath) {
+            $pageResult = $this->extractFromImage($pagePath);
+            @unlink($pagePath);
+
+            if (!empty($pageResult['notice'])) {
+                $usedAiVision = true;
+            }
+            if (empty($combined['sheet_meta']['school_name']) && !empty($pageResult['sheet_meta']['school_name'])) {
+                $combined['sheet_meta'] = $pageResult['sheet_meta'];
+            }
+            foreach ($pageResult['entries'] as $entry) {
+                $combined['entries'][] = $entry;
+            }
+        }
+
+        if ($usedAiVision) {
+            $combined['notice'] = 'This PDF had no embedded text layer, so the rows below were read '
+                . 'using AI vision instead of standard OCR. Please double‑check them carefully against '
+                . 'the original document.';
+        } elseif (empty($combined['entries'])) {
+            $combined['notice'] = 'This PDF has no embedded text — it looks like a photo or scan saved '
+                . 'as a PDF rather than a typed document, and automatic OCR/AI vision could not '
+                . 'confidently read any rows from it either. Please add the candidate rows manually below.';
+        }
+
+        return $combined;
     }
 
     /**
-     * Image upload → preprocess → Tesseract → parse
+     * Returns true if $text has enough real content to be worth parsing.
+     * Filters out PDFs whose only "text layer" is a scanner-app watermark
+     * (e.g. CamScanner free exports embed just the word "CamScanner").
+     */
+    private function hasSubstantiveText(string $text): bool
+    {
+        $clean = trim(preg_replace('/\bCamScanner\b/i', '', $text));
+        return strlen($clean) >= 30 && preg_match('/\d/', $clean) === 1;
+    }
+
+    /**
+     * Rasterizes every page of a PDF to a PNG via poppler's pdftoppm.
+     * Returns an empty array if pdftoppm isn't installed on the server.
+     */
+    private function rasterizePdfPages(string $pdfPath): array
+    {
+        exec('which pdftoppm 2>&1', $out, $code);
+        if ($code !== 0) {
+            return [];
+        }
+
+        $prefix = sys_get_temp_dir() . '/wakata_pdfimg_' . uniqid();
+        exec(sprintf(
+            'pdftoppm -r 300 -png %s %s 2>&1',
+            escapeshellarg($pdfPath),
+            escapeshellarg($prefix)
+        ), $out, $code);
+
+        $pages = glob($prefix . '*.png');
+        sort($pages);
+        return $pages;
+    }
+
+    /**
+     * Image upload → preprocess → Tesseract (free, fast, local).
+     * If that finds too few rows — the telltale sign of handwriting, which
+     * Tesseract cannot read — automatically fall back to Gemini's vision API
+     * (free tier, see GEMINI_API_KEY in .env) for a proper read.
      */
     private function extractFromImage(string $imgPath): array
     {
-        $this->ensureTesseract();
-        $processed = $this->preprocessImage($imgPath);
-        $text = $this->runTesseract($processed);
-        if ($processed !== $imgPath)
-            @unlink($processed);
-        return $this->parseOcrText($text);
+        $tesseractResult = ['sheet_meta' => $this->extractMeta([]), 'entries' => []];
+
+        try {
+            $this->ensureTesseract();
+            $processed = $this->preprocessImage($imgPath);
+            $text = $this->runTesseract($processed);
+            if ($processed !== $imgPath) {
+                @unlink($processed);
+            }
+            $tesseractResult = $this->parseOcrText($text);
+        } catch (\Throwable $e) {
+            Log::warning('Tesseract OCR unavailable/failed, relying on AI vision fallback: ' . $e->getMessage());
+        }
+
+        if (count($tesseractResult['entries']) >= 3) {
+            return $tesseractResult;
+        }
+
+        $gemini = $this->extractWithGeminiVision($imgPath);
+
+        if ($gemini !== null && count($gemini['entries']) > count($tesseractResult['entries'])) {
+            $gemini['notice'] = count($tesseractResult['entries']) === 0
+                ? 'Standard OCR could not confidently read this image (common with handwriting), so it '
+                . 'was automatically re-processed using AI vision instead. Please double‑check the rows '
+                . 'below carefully.'
+                : 'Standard OCR only found a few rows on this image, so it was automatically '
+                . 're-processed using AI vision for a more complete read. Please double‑check the rows '
+                . 'below carefully.';
+            return $gemini;
+        }
+
+        return $tesseractResult;
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // GEMINI VISION FALLBACK  (free tier — for handwritten / low-quality scans)
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /**
+     * Sends an image to Google's Gemini API (free tier) and asks it to read
+     * the score sheet directly into our exact JSON schema. Returns null if
+     * no API key is configured, or if the request fails for any reason —
+     * callers treat that the same as "no improvement over Tesseract."
+     */
+    private function extractWithGeminiVision(string $imagePath): ?array
+    {
+        $apiKey = config('services.gemini.api_key');
+        if (empty($apiKey)) {
+            return null;
+        }
+
+        $mimeType = match (strtolower(pathinfo($imagePath, PATHINFO_EXTENSION))) {
+            'png' => 'image/png',
+            'webp' => 'image/webp',
+            default => 'image/jpeg',
+        };
+
+        $imageData = base64_encode(file_get_contents($imagePath));
+
+        $schema = [
+            'type' => 'OBJECT',
+            'properties' => [
+                'school_name' => ['type' => 'STRING', 'nullable' => true],
+                'zone' => ['type' => 'STRING', 'nullable' => true],
+                'ref_no' => ['type' => 'STRING', 'nullable' => true],
+                'subject' => ['type' => 'STRING', 'nullable' => true],
+                'exam_year' => ['type' => 'STRING', 'nullable' => true],
+                'entries' => [
+                    'type' => 'ARRAY',
+                    'items' => [
+                        'type' => 'OBJECT',
+                        'properties' => [
+                            'serial_no' => ['type' => 'INTEGER'],
+                            'candidate_name' => ['type' => 'STRING'],
+                            'p1' => ['type' => 'NUMBER', 'nullable' => true],
+                            'p2' => ['type' => 'NUMBER', 'nullable' => true],
+                            'p3' => ['type' => 'NUMBER', 'nullable' => true],
+                            'p4' => ['type' => 'NUMBER', 'nullable' => true],
+                            'average' => ['type' => 'NUMBER', 'nullable' => true],
+                            'grade' => ['type' => 'STRING', 'nullable' => true],
+                        ],
+                        'required' => ['serial_no', 'candidate_name'],
+                    ],
+                ],
+            ],
+            'required' => ['entries'],
+        ];
+
+        $prompt = 'You are reading a UCE mock exam score sheet (printed or handwritten) for a Ugandan '
+            . 'school. Read every row of the candidate table carefully, including handwritten entries. '
+            . 'Rules: "S/N" or "S/H" is the serial number column. Read each candidate\'s full name '
+            . 'exactly as written, in uppercase. Each P1, P2, P3, P4 column holds a numeric score, only '
+            . 'if that column actually exists on the sheet — if a column such as AVERAGE or GRADE does '
+            . 'not appear on the sheet at all, leave it null for every row rather than guessing a value. '
+            . 'If a digit is ambiguous, use the most visually likely digit rather than skipping the row. '
+            . 'Do not skip any row in the table, even if the handwriting is messy. Also extract header '
+            . 'info if present: school name, zone, REF number, subject, exam year. Return only the '
+            . 'structured data described by the schema — do not invent rows or scores that are not on '
+            . 'the sheet.';
+
+        try {
+            $response = Http::timeout(60)->post(
+                'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key='
+                . $apiKey,
+                [
+                    'contents' => [[
+                        'parts' => [
+                            ['text' => $prompt],
+                            ['inline_data' => ['mime_type' => $mimeType, 'data' => $imageData]],
+                        ],
+                    ]],
+                    'generationConfig' => [
+                        'responseMimeType' => 'application/json',
+                        'responseSchema' => $schema,
+                        'temperature' => 0,
+                    ],
+                ]
+            );
+
+            if (!$response->successful()) {
+                Log::warning('Gemini vision request failed: ' . $response->body());
+                return null;
+            }
+
+            $text = $response->json('candidates.0.content.parts.0.text');
+            if (!$text) {
+                return null;
+            }
+
+            $decoded = json_decode($text, true);
+            if (!is_array($decoded) || !isset($decoded['entries'])) {
+                return null;
+            }
+
+            return [
+                'sheet_meta' => [
+                    'school_name' => $decoded['school_name'] ?? null,
+                    'zone' => $decoded['zone'] ?? null,
+                    'ref_no' => $decoded['ref_no'] ?? null,
+                    'subject' => $decoded['subject'] ?? null,
+                    'exam_year' => $decoded['exam_year'] ?? null,
+                ],
+                'entries' => array_map(function ($e) {
+                    return [
+                        'serial_no' => (int) ($e['serial_no'] ?? 0),
+                        'candidate_name' => strtoupper(trim($e['candidate_name'] ?? '')),
+                        'p1' => isset($e['p1']) ? (float) $e['p1'] : null,
+                        'p2' => isset($e['p2']) ? (float) $e['p2'] : null,
+                        'p3' => isset($e['p3']) ? (float) $e['p3'] : null,
+                        'p4' => isset($e['p4']) ? (float) $e['p4'] : null,
+                        'average' => isset($e['average']) ? (float) $e['average'] : null,
+                        'grade' => $e['grade'] ?? null,
+                    ];
+                }, $decoded['entries']),
+            ];
+        } catch (\Throwable $e) {
+            Log::warning('Gemini vision call failed: ' . $e->getMessage());
+            return null;
+        }
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -335,15 +565,8 @@ class ScanController extends Controller
     private function extractEntries(array $lines): array
     {
         $entries = [];
-        $pastHeader = false;
 
         foreach ($lines as $line) {
-            if (!$pastHeader && preg_match('/S\s*[\/\\\\]\s*N.*NAME.*P\s*[12]/i', $line)) {
-                $pastHeader = true;
-                continue;
-            }
-            if (!$pastHeader)
-                continue;
             if (preg_match('/^[\|\-\s_=]+$/', $line))
                 continue;
 
@@ -383,10 +606,11 @@ class ScanController extends Controller
             }
         }
 
-        // Relaxed fallback
+        // Relaxed fallback — at least one trailing score, so sheets with
+        // fewer columns (e.g. only P1, or P1-P2) still get picked up
         if (
             preg_match(
-                '/^(\d{1,3})[.\)]\s+(.{4,50}?)\s+((?:\d+\.?\d*\s*){3,})$/',
+                '/^(\d{1,3})[.\)]\s+(.{4,50}?)\s+((?:\d+\.?\d*\s*){1,})$/',
                 $line,
                 $m
             )

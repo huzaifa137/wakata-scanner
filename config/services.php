@@ -35,4 +35,11 @@ return [
         ],
     ],
 
+    'gemini' => [
+        // Free at https://aistudio.google.com/apikey — no credit card needed.
+        // Used only as a fallback when Tesseract finds too few rows on a
+        // scan (e.g. handwritten score sheets). Leave blank to disable.
+        'api_key' => env('GEMINI_API_KEY'),
+    ],
+
 ];

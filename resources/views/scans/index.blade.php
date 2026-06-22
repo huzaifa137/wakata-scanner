@@ -121,8 +121,9 @@
                     </ul>
                     <div class="alert alert-success py-2 px-3 mb-0" style="font-size:.78rem">
                         <i class="bi bi-shield-check me-1"></i>
-                        <strong>100% Local:</strong> Tesseract OCR runs entirely on your server —
-                        no data is sent to any external service.
+                        <strong>Tesseract-first:</strong> OCR runs locally on your server for free.
+                        Only if it can't confidently read a scan (e.g. handwriting) is the image sent
+                        to Google's Gemini API as a fallback — only when configured.
                     </div>
                 </div>
             </div>
@@ -132,9 +133,9 @@
                 <div class="card-body py-2 px-3 d-flex align-items-center gap-3">
                     <i class="bi bi-cpu text-success fs-4"></i>
                     <div>
-                        <div class="fw-semibold" style="font-size:.82rem">Tesseract OCR Engine</div>
+                        <div class="fw-semibold" style="font-size:.82rem">Tesseract OCR + AI Vision Fallback</div>
                         <div class="text-muted" style="font-size:.75rem">
-                            Free · Open-source · No API key needed ·
+                            Tesseract is free &amp; local · Gemini fallback handles handwriting ·
                             <a href="/check" target="_blank" class="text-decoration-none">Check status</a>
                         </div>
                     </div>
@@ -192,12 +193,14 @@
         </button>
     </div>
 
-    {{-- OCR warning banner (shown when few rows found) --}}
+    {{-- OCR warning banner (shown when few rows found, or backend sends a notice) --}}
     <div id="ocrWarning" class="alert alert-warning d-none mb-3" style="font-size:.82rem">
         <i class="bi bi-exclamation-triangle me-2"></i>
-        <strong>Only a few rows were detected.</strong>
-        This can happen with low-quality photos or unusual layouts.
-        Please add any missing rows manually using the <em>"+ Add Row"</em> button below.
+        <span id="ocrWarningText">
+            <strong>Only a few rows were detected.</strong>
+            This can happen with low-quality photos or unusual layouts.
+            Please add any missing rows manually using the <em>"+ Add Row"</em> button below.
+        </span>
     </div>
 
     {{-- Sheet meta --}}
@@ -420,34 +423,16 @@ async function startScan() {
         }
 
     } else {
-        // ── IMAGE: run Tesseract.js in the browser, then send text to server ──
-        showLoading(
-            'Running OCR on your device…',
-            'Reading the score sheet image — this takes 10–30 seconds'
-        );
+        // ── IMAGE: send straight to server. Server tries Tesseract OCR
+        // first (free/local), and automatically falls back to AI vision for
+        // handwriting / low-quality scans when Tesseract finds too little ──
+        showLoading('Reading your photo…', 'Running OCR — this can take 10–20 seconds');
+
+        const formData = new FormData();
+        formData.append('file',      selectedFile);
+        formData.append('scan_type', selectedType);
 
         try {
-            // Run Tesseract.js entirely in the browser
-            const worker = await Tesseract.createWorker('eng', 1, {
-                logger: m => {
-                    if (m.status === 'recognizing text') {
-                        document.getElementById('loadingSubtitle').textContent =
-                            'Reading text… ' + Math.round(m.progress * 100) + '%';
-                    }
-                }
-            });
-
-            const { data: { text } } = await worker.recognize(selectedFile);
-            await worker.terminate();
-
-            // Send OCR text + file metadata to server for parsing
-            const formData = new FormData();
-            formData.append('file',      selectedFile);
-            formData.append('scan_type', selectedType);
-            formData.append('ocr_text',  text);  // ← key addition
-
-            document.getElementById('loadingSubtitle').textContent = 'Parsing extracted text…';
-
             const res    = await fetch('{{ route("scan.process") }}', {
                 method:  'POST',
                 headers: { 'X-CSRF-TOKEN': csrfToken, 'Accept': 'application/json' },
@@ -458,7 +443,7 @@ async function startScan() {
 
             if (!result.success) {
                 Swal.fire({
-                    title: 'Parsing Failed',
+                    title: 'Reading Failed',
                     html:  '<pre style="font-size:.75rem;text-align:left;white-space:pre-wrap">' +
                            escHtml(result.message || 'Unknown error') + '</pre>',
                     icon:  'error',
@@ -471,7 +456,7 @@ async function startScan() {
 
         } catch (err) {
             hideLoading();
-            Swal.fire('OCR Error', err.message, 'error');
+            Swal.fire('Network Error', err.message, 'error');
         }
     }
 }
@@ -490,9 +475,22 @@ function populatePreview(data) {
     (data.entries || []).forEach((e, i) => appendRow(e, i));
     updateRowCount();
 
-    // Warn if very few rows detected (possibly poor scan quality)
+    // Warn if very few rows detected (possibly poor scan quality), or show
+    // a specific backend notice (e.g. "this PDF has no text layer") when present
     const count = (data.entries || []).length;
-    document.getElementById('ocrWarning').classList.toggle('d-none', count >= 3);
+    const warningBanner = document.getElementById('ocrWarning');
+    const warningText   = document.getElementById('ocrWarningText');
+
+    if (data.notice) {
+        warningText.innerHTML = '<strong>Heads up:</strong> ' + escHtml(data.notice);
+        warningBanner.classList.remove('d-none');
+    } else {
+        warningText.innerHTML =
+            '<strong>Only a few rows were detected.</strong> ' +
+            'This can happen with low-quality photos or unusual layouts. ' +
+            'Please add any missing rows manually using the <em>"+ Add Row"</em> button below.';
+        warningBanner.classList.toggle('d-none', count >= 3);
+    }
 }
 
 function appendRow(entry = {}, index = null) {
