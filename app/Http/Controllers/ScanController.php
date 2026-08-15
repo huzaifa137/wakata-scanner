@@ -374,23 +374,30 @@ class ScanController extends Controller
             . 'the sheet.';
 
         try {
-            $response = Http::timeout(60)->post(
-                'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key='
-                . $apiKey,
-                [
-                    'contents' => [[
-                        'parts' => [
-                            ['text' => $prompt],
-                            ['inline_data' => ['mime_type' => $mimeType, 'data' => $imageData]],
+            $response = Http::timeout(60)
+                ->retry(3, 1000, function ($exception, $request) {
+                    // Only retry on transient server-side errors (503/429), not on
+                    // auth or bad-request errors which won't fix themselves.
+                    return $exception instanceof \Illuminate\Http\Client\RequestException
+                        && in_array($exception->response->status(), [429, 503]);
+                }, throw: false)
+                ->post(
+                    'https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent?key='
+                    . $apiKey,
+                    [
+                        'contents' => [[
+                            'parts' => [
+                                ['text' => $prompt],
+                                ['inline_data' => ['mime_type' => $mimeType, 'data' => $imageData]],
+                            ],
+                        ]],
+                        'generationConfig' => [
+                            'responseMimeType' => 'application/json',
+                            'responseSchema' => $schema,
+                            'temperature' => 0,
                         ],
-                    ]],
-                    'generationConfig' => [
-                        'responseMimeType' => 'application/json',
-                        'responseSchema' => $schema,
-                        'temperature' => 0,
-                    ],
-                ]
-            );
+                    ]
+                );
 
             if (!$response->successful()) {
                 Log::warning('Gemini vision request failed: ' . $response->body());
