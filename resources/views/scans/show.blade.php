@@ -18,9 +18,9 @@
         <button onclick="window.print()" class="btn btn-sm btn-outline-secondary">
             <i class="bi bi-printer me-1"></i> Print
         </button>
-        <button onclick="exportCsv()" class="btn btn-sm btn-outline-success">
-            <i class="bi bi-download me-1"></i> Export CSV
-        </button>
+        <a href="{{ route('scan.export', $scoreSheet) }}" class="btn btn-sm btn-outline-success">
+            <i class="bi bi-file-earmark-excel me-1"></i> Export to Excel
+        </a>
     </div>
 </div>
 
@@ -89,20 +89,6 @@
 @endsection
 
 @push('scripts')
-<script>
-function exportCsv() {
-    const rows = [['#','Candidate Name','P1','P2','P3','P4','Average','Grade']];
-    document.querySelectorAll('#entriesTable tbody tr').forEach(tr => {
-        rows.push(Array.from(tr.cells).map(td => td.innerText.trim()));
-    });
-    const csv = rows.map(r => r.map(c => `"${c}"`).join(',')).join('\n');
-    const blob = new Blob([csv], { type:'text/csv' });
-    const a    = document.createElement('a');
-    a.href     = URL.createObjectURL(blob);
-    a.download = `score_sheet_{{ $scoreSheet->id }}.csv`;
-    a.click();
-}
-</script>
 <style>
 @media print {
     .sidebar, .topbar, .btn, .ms-auto { display: none !important; }

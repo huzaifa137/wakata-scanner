@@ -243,6 +243,9 @@
                 <button class="btn btn-sm btn-outline-secondary" onclick="addRow()">
                     <i class="bi bi-plus-circle me-1"></i>Add Row
                 </button>
+                <button class="btn btn-sm btn-outline-success" onclick="exportToExcel()">
+                    <i class="bi bi-file-earmark-excel me-1"></i>Export to Excel
+                </button>
                 <button class="btn btn-sm btn-success" onclick="saveData()">
                     <i class="bi bi-cloud-check me-1"></i>Save to Database
                 </button>
@@ -275,9 +278,14 @@
             <small class="text-muted">
                 <i class="bi bi-pencil me-1"></i>Click any cell to edit
             </small>
-            <button class="btn btn-success px-4" onclick="saveData()">
-                <i class="bi bi-cloud-check me-2"></i>Save All to Database
-            </button>
+            <div class="d-flex gap-2">
+                <button class="btn btn-outline-success px-3" onclick="exportToExcel()">
+                    <i class="bi bi-file-earmark-excel me-2"></i>Export to Excel
+                </button>
+                <button class="btn btn-success px-4" onclick="saveData()">
+                    <i class="bi bi-cloud-check me-2"></i>Save All to Database
+                </button>
+            </div>
         </div>
     </div>
 </div>
@@ -624,6 +632,58 @@ async function saveData() {
         } else {
             Swal.fire('Save Failed', result.message, 'error');
         }
+
+    } catch (err) {
+        hideLoading();
+        Swal.fire('Error', err.message, 'error');
+    }
+}
+
+// ── EXPORT TO EXCEL ────────────────────────────────────────────────────────
+async function exportToExcel() {
+    const entries = collectTableData().filter(e => e.candidate_name);
+
+    if (!entries.length) {
+        Swal.fire('Empty', 'Add at least one candidate row before exporting.', 'warning');
+        return;
+    }
+
+    showLoading('Building Excel file…', 'Preparing your download');
+
+    try {
+        const res = await fetch('{{ route("scan.export-preview") }}', {
+            method:  'POST',
+            headers: {
+                'X-CSRF-TOKEN': csrfToken,
+                'Content-Type': 'application/json',
+                'Accept':       'application/json',
+            },
+            body: JSON.stringify({
+                school_name: document.getElementById('meta_school_name').value,
+                subject:     document.getElementById('meta_subject').value,
+                entries,
+            }),
+        });
+
+        hideLoading();
+
+        if (!res.ok) {
+            const result = await res.json().catch(() => ({}));
+            Swal.fire('Export Failed', result.message || 'Could not generate the Excel file.', 'error');
+            return;
+        }
+
+        const blob = await res.blob();
+        const disposition = res.headers.get('Content-Disposition') || '';
+        const match = disposition.match(/filename="?([^"]+)"?/);
+        const filename = match ? match[1] : 'score_sheet.xlsx';
+
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = filename;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
 
     } catch (err) {
         hideLoading();

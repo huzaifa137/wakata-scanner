@@ -70,6 +70,9 @@
                                 <a href="{{ route('scan.show', $sheet) }}" class="btn btn-sm btn-outline-primary" style="font-size:.72rem;padding:.2rem .5rem">
                                     <i class="bi bi-eye"></i> View
                                 </a>
+                                <a href="{{ route('scan.export', $sheet) }}" class="btn btn-sm btn-outline-success" style="font-size:.72rem;padding:.2rem .5rem" title="Export to Excel">
+                                    <i class="bi bi-file-earmark-excel"></i>
+                                </a>
                                 <button onclick="deleteSheet({{ $sheet->id }})" class="btn btn-sm btn-outline-danger" style="font-size:.72rem;padding:.2rem .5rem">
                                     <i class="bi bi-trash3"></i>
                                 </button>

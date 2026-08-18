@@ -4,6 +4,7 @@ namespace App\Http\Controllers;
 
 use App\Models\ScoreEntry;
 use App\Models\ScoreSheet;
+use App\Support\XlsxWriter;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Http;
@@ -143,6 +144,153 @@ class ScanController extends Controller
     {
         $scoreSheet->load('entries');
         return view('scans.show', compact('scoreSheet'));
+    }
+
+    // -----------------------------------------------------------------------
+    // EXPORT (unsaved preview) — Step-2 "Review & Edit" table → .xlsx
+    // -----------------------------------------------------------------------
+    public function exportPreview(Request $request)
+    {
+        $request->validate([
+            'school_name' => 'nullable|string|max:255',
+            'subject' => 'nullable|string|max:255',
+            'entries' => 'required|array|min:1',
+            'entries.*.candidate_name' => 'required|string|max:255',
+            'entries.*.p1' => 'nullable|numeric',
+            'entries.*.p2' => 'nullable|numeric',
+            'entries.*.p3' => 'nullable|numeric',
+            'entries.*.p4' => 'nullable|numeric',
+            'entries.*.average' => 'nullable|numeric',
+            'entries.*.grade' => 'nullable|string|max:10',
+        ]);
+
+        $meta = [
+            'school_name' => $request->input('school_name'),
+            'subject' => $request->input('subject'),
+        ];
+
+        $entries = collect($request->input('entries'))
+            ->filter(fn($e) => trim($e['candidate_name'] ?? '') !== '')
+            ->values()
+            ->all();
+
+        if (empty($entries)) {
+            return response()->json(['success' => false, 'message' => 'No candidate rows to export.'], 422);
+        }
+
+        [$rows, $colWidths] = $this->buildScoreSheetExportRows($meta, $entries);
+        $filename = $this->exportFilename($meta['school_name'], $meta['subject']);
+
+        return XlsxWriter::download($filename, $meta['subject'] ?? 'Scores', $rows, $colWidths);
+    }
+
+    // -----------------------------------------------------------------------
+    // EXPORT (saved record) — a stored ScoreSheet → .xlsx
+    // -----------------------------------------------------------------------
+    public function export(ScoreSheet $scoreSheet)
+    {
+        $scoreSheet->load('entries');
+
+        $meta = [
+            'school_name' => $scoreSheet->school_name,
+            'subject' => $scoreSheet->subject,
+        ];
+
+        $entries = $scoreSheet->entries->sortBy('serial_no')->map(fn($e) => [
+            'candidate_name' => $e->candidate_name,
+            'p1' => $e->p1,
+            'p2' => $e->p2,
+            'p3' => $e->p3,
+            'p4' => $e->p4,
+            'average' => $e->average,
+            'grade' => $e->grade,
+        ])->values()->all();
+
+        if (empty($entries)) {
+            return back()->with('error', 'No candidate rows to export.');
+        }
+
+        [$rows, $colWidths] = $this->buildScoreSheetExportRows($meta, $entries);
+        $filename = $this->exportFilename($meta['school_name'], $meta['subject'], $scoreSheet->id);
+
+        return XlsxWriter::download($filename, $meta['subject'] ?? 'Scores', $rows, $colWidths);
+    }
+
+    /**
+     * Builds the row data for a candidate-scores workbook:
+     *   School Name: ...
+     *   Subject: ...
+     *   (blank row)
+     *   # | Candidate Name | P1 | P2 | P3 | P4 | Average | Grade   <- only columns
+     *   1 | ...             | 82 | ...                             <- that actually
+     *                                                                  have marks
+     *
+     * Returns [rows, colWidths] ready for XlsxWriter.
+     */
+    private function buildScoreSheetExportRows(array $meta, array $entries): array
+    {
+        // Only include a paper/score column if at least one entry has a value for it.
+        $scoreColumns = [
+            'p1' => 'P1',
+            'p2' => 'P2',
+            'p3' => 'P3',
+            'p4' => 'P4',
+            'average' => 'Average',
+            'grade' => 'Grade',
+        ];
+
+        $activeColumns = array_filter(
+            array_keys($scoreColumns),
+            fn($key) => collect($entries)->contains(
+                fn($e) => isset($e[$key]) && $e[$key] !== null && $e[$key] !== ''
+            )
+        );
+
+        $rows = [];
+
+        $rows[] = [['value' => 'School Name:', 'bold' => true], $meta['school_name'] ?: '—'];
+        $rows[] = [['value' => 'Subject:', 'bold' => true], $meta['subject'] ?: '—'];
+        $rows[] = []; // blank spacer row
+
+        $header = ['#', 'Candidate Name'];
+        foreach ($activeColumns as $col) {
+            $header[] = $scoreColumns[$col];
+        }
+        $rows[] = array_map(fn($h) => ['value' => $h, 'bold' => true], $header);
+
+        foreach ($entries as $i => $entry) {
+            $row = [$i + 1, $entry['candidate_name']];
+            foreach ($activeColumns as $col) {
+                $val = $entry[$col] ?? null;
+                if ($col === 'grade') {
+                    $row[] = $val !== null && $val !== '' ? (string) $val : '';
+                } else {
+                    $row[] = $val !== null && $val !== '' ? (float) $val : '';
+                }
+            }
+            $rows[] = $row;
+        }
+
+        $colWidths = [1 => 6, 2 => 32];
+        foreach (array_values($activeColumns) as $idx => $col) {
+            $colWidths[3 + $idx] = $col === 'grade' ? 10 : 10;
+        }
+
+        return [$rows, $colWidths];
+    }
+
+    private function exportFilename(?string $schoolName, ?string $subject, ?int $sheetId = null): string
+    {
+        $base = trim(($schoolName ?: 'score_sheet') . '_' . ($subject ?: ''));
+        $base = preg_replace('/[^A-Za-z0-9]+/', '_', $base);
+        $base = trim($base, '_');
+        if ($base === '') {
+            $base = 'score_sheet';
+        }
+        if ($sheetId) {
+            $base .= '_' . $sheetId;
+        }
+        return strtolower($base) . '.xlsx';
     }
 
     public function records(Request $request)
